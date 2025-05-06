@@ -267,3 +267,147 @@
 
 ;; Initialize contract
 (initialize-counters)
+
+;; Helper function to get minimum of two numbers
+(define-private (min-of (a uint) (b uint))
+  (if (<= a b)
+      a
+      b))
+
+(define-map matching-pools 
+  { pool-id: uint }
+  {
+    sponsor: principal,
+    disaster-id: uint,
+    match-limit: uint,
+    remaining-funds: uint,
+    active: bool
+  }
+)
+
+(define-map matching-pool-counter
+  { pool-type: (string-ascii 20) }
+  { counter: uint }
+)
+
+(define-public (create-matching-pool (disaster-id uint) (match-limit uint))
+  (let
+    (
+      (current-counter (default-to { counter: u0 } (map-get? matching-pool-counter { pool-type: "global" })))
+      (new-id (+ (get counter current-counter) u1))
+    )
+    (try! (stx-transfer? match-limit tx-sender (as-contract tx-sender)))
+    (map-set matching-pool-counter { pool-type: "global" } { counter: new-id })
+    (map-set matching-pools { pool-id: new-id }
+      {
+        sponsor: tx-sender,
+        disaster-id: disaster-id,
+        match-limit: match-limit,
+        remaining-funds: match-limit,
+        active: true
+      }
+    )
+    (ok new-id)
+  )
+)
+(define-public (close-matching-pool (pool-id uint))
+  (let
+    (
+      (pool (unwrap! (map-get? matching-pools { pool-id: pool-id }) (err u404)))
+    )
+    (asserts! (is-eq tx-sender (get sponsor pool)) err-not-authorized)
+    (asserts! (get active pool) err-invalid-status)
+    (map-set matching-pools { pool-id: pool-id }
+      (merge pool { active: false })
+    )
+    (ok true)
+  )
+)
+
+(define-public (donate-with-matching (disaster-id uint) (amount uint) (pool-id uint))
+  (let
+    (
+      (pool (unwrap! (map-get? matching-pools { pool-id: pool-id }) (err u404)))
+      (matching-amount (min-of amount (get remaining-funds pool)))
+    )
+    (try! (donate-to-disaster disaster-id amount))
+    (and (> matching-amount u0)
+      (begin
+        (try! (as-contract (donate-to-disaster disaster-id matching-amount)))
+        (map-set matching-pools { pool-id: pool-id }
+          (merge pool { remaining-funds: (- (get remaining-funds pool) matching-amount) })
+        )
+      )
+    )
+    (ok true)
+  )
+)
+
+
+(define-map milestones
+  { milestone-id: uint }
+  {
+    disaster-id: uint,
+    org-id: uint,
+    description: (string-ascii 500),
+    amount: uint,
+    completed: bool,
+    approved: bool
+  }
+)
+
+(define-map milestone-counter
+  { milestone-type: (string-ascii 20) }
+  { counter: uint }
+)
+
+(define-public (create-milestone (disaster-id uint) (org-id uint) (description (string-ascii 500)) (amount uint))
+  (let
+    (
+      (current-counter (default-to { counter: u0 } (map-get? milestone-counter { milestone-type: "global" })))
+      (new-id (+ (get counter current-counter) u1))
+    )
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (map-set milestone-counter { milestone-type: "global" } { counter: new-id })
+    (map-set milestones { milestone-id: new-id }
+      {
+        disaster-id: disaster-id,
+        org-id: org-id,
+        description: description,
+        amount: amount,
+        completed: false,
+        approved: false
+      }
+    )
+    (ok new-id)
+  )
+)
+
+(define-public (complete-milestone (milestone-id uint))
+  (let
+    (
+      (milestone (unwrap! (map-get? milestones { milestone-id: milestone-id }) (err u404)))
+      (org (unwrap! (map-get? relief-organizations { org-id: (get org-id milestone) }) err-organization-not-found))
+    )
+    (asserts! (is-eq tx-sender (get wallet org)) err-not-authorized)
+    (map-set milestones { milestone-id: milestone-id }
+      (merge milestone { completed: true })
+    )
+    (ok true)
+  )
+)
+
+(define-public (approve-and-disburse-milestone (milestone-id uint))
+  (let
+    (
+      (milestone (unwrap! (map-get? milestones { milestone-id: milestone-id }) (err u404)))
+    )
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (get completed milestone) err-invalid-status)
+    (try! (disburse-funds (get disaster-id milestone) (get org-id milestone) (get amount milestone)))
+    (map-set milestones { milestone-id: milestone-id }
+      (merge milestone { approved: true })
+    )
+    (ok true)
+  )
+)
