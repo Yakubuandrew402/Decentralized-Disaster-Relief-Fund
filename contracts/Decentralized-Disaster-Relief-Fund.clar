@@ -12,6 +12,30 @@
 (define-constant err-organization-already-exists (err u107))
 (define-constant err-invalid-status (err u108))
 
+(define-constant err-insufficient-reserve (err u109))
+(define-constant err-not-emergency (err u110))
+(define-constant emergency-severity-threshold u5)
+(define-constant reserve-percentage u10)
+
+(define-data-var emergency-reserve-balance uint u0)
+(define-data-var total-emergency-disbursements uint u0)
+
+(define-map emergency-disbursements
+  { emergency-id: uint }
+  {
+    disaster-id: uint,
+    org-id: uint,
+    amount: uint,
+    timestamp: uint,
+    authorized-by: principal
+  }
+)
+
+(define-map emergency-counter
+  { emergency-type: (string-ascii 20) }
+  { counter: uint }
+)
+
 (define-data-var total-donations uint u0)
 (define-data-var total-disbursements uint u0)
 
@@ -411,3 +435,134 @@
     (ok true)
   )
 )
+
+
+
+(define-private (calculate-reserve-amount (donation-amount uint))
+  (/ (* donation-amount reserve-percentage) u100)
+)
+
+(define-private (update-donation-with-reserve (disaster-id uint) (amount uint))
+  (let
+    (
+      (reserve-amount (calculate-reserve-amount amount))
+      (net-donation (- amount reserve-amount))
+      (disaster (unwrap-panic (map-get? disasters { disaster-id: disaster-id })))
+    )
+    (var-set emergency-reserve-balance (+ (var-get emergency-reserve-balance) reserve-amount))
+    (map-set disasters { disaster-id: disaster-id }
+      (merge disaster { funds-allocated: (+ (get funds-allocated disaster) net-donation) })
+    )
+    net-donation
+  )
+)
+
+(define-public (donate-to-disaster-with-reserve (disaster-id uint) (amount uint))
+  (let
+    (
+      (disaster (map-get? disasters { disaster-id: disaster-id }))
+      (current-counter (default-to { counter: u0 } (map-get? donation-counter { donation-type: "global" })))
+      (new-id (+ (get counter current-counter) u1))
+      (net-donation (calculate-reserve-amount amount))
+    )
+    (asserts! (not (is-none disaster)) err-disaster-not-found)
+    (asserts! (get active (unwrap-panic disaster)) err-invalid-status)
+    (asserts! (> amount u0) err-invalid-amount)
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    
+    (map-set donation-counter { donation-type: "global" } { counter: new-id })
+    (map-set donations { donation-id: new-id }
+      {
+        donor: tx-sender,
+        amount: amount,
+        disaster-id: disaster-id,
+        timestamp: stacks-block-height
+      }
+    )
+    
+    (update-donation-with-reserve disaster-id amount)
+    (var-set total-donations (+ (var-get total-donations) amount))
+    (ok new-id)
+  )
+)
+
+(define-public (emergency-disburse (disaster-id uint) (org-id uint) (amount uint))
+  (let
+    (
+      (disaster (unwrap! (map-get? disasters { disaster-id: disaster-id }) err-disaster-not-found))
+      (organization (unwrap! (map-get? relief-organizations { org-id: org-id }) err-organization-not-found))
+      (current-counter (default-to { counter: u0 } (map-get? emergency-counter { emergency-type: "global" })))
+      (new-id (+ (get counter current-counter) u1))
+      (current-reserve (var-get emergency-reserve-balance))
+    )
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (>= (get severity disaster) emergency-severity-threshold) err-not-emergency)
+    (asserts! (get active disaster) err-invalid-status)
+    (asserts! (get verified organization) err-not-authorized)
+    (asserts! (>= current-reserve amount) err-insufficient-reserve)
+    
+    (try! (as-contract (stx-transfer? amount tx-sender (get wallet organization))))
+    
+    (map-set emergency-counter { emergency-type: "global" } { counter: new-id })
+    (map-set emergency-disbursements { emergency-id: new-id }
+      {
+        disaster-id: disaster-id,
+        org-id: org-id,
+        amount: amount,
+        timestamp: stacks-block-height,
+        authorized-by: tx-sender
+      }
+    )
+    
+    (var-set emergency-reserve-balance (- current-reserve amount))
+    (var-set total-emergency-disbursements (+ (var-get total-emergency-disbursements) amount))
+    
+    (map-set relief-organizations { org-id: org-id }
+      (merge organization { total-received: (+ (get total-received organization) amount) })
+    )
+    
+    (ok new-id)
+  )
+)
+
+(define-public (transfer-to-emergency-reserve (amount uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (> amount u0) err-invalid-amount)
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    (var-set emergency-reserve-balance (+ (var-get emergency-reserve-balance) amount))
+    (ok true)
+  )
+)
+
+(define-read-only (get-emergency-reserve-balance)
+  (var-get emergency-reserve-balance)
+)
+
+(define-read-only (get-total-emergency-disbursements)
+  (var-get total-emergency-disbursements)
+)
+
+(define-read-only (get-emergency-disbursement-details (emergency-id uint))
+  (map-get? emergency-disbursements { emergency-id: emergency-id })
+)
+
+(define-read-only (get-reserve-percentage)
+  reserve-percentage
+)
+
+(define-read-only (calculate-donation-split (amount uint))
+  (let
+    (
+      (reserve-amount (calculate-reserve-amount amount))
+      (net-donation (- amount reserve-amount))
+    )
+    {
+      reserve-amount: reserve-amount,
+      net-donation: net-donation,
+      total-amount: amount
+    }
+  )
+)
+
+(map-set emergency-counter { emergency-type: "global" } { counter: u0 })
