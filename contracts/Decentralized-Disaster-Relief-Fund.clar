@@ -566,3 +566,181 @@
 )
 
 (map-set emergency-counter { emergency-type: "global" } { counter: u0 })
+
+(define-constant bronze-tier-threshold u1000000)
+(define-constant silver-tier-threshold u5000000)
+(define-constant gold-tier-threshold u15000000)
+(define-constant platinum-tier-threshold u50000000)
+
+(define-map donor-profiles
+  { donor: principal }
+  {
+    total-donated: uint,
+    reputation-points: uint,
+    tier: (string-ascii 10),
+    disasters-supported: uint,
+    last-donation-block: uint,
+    streak-count: uint
+  }
+)
+
+(define-map donor-disaster-impact
+  { donor: principal, disaster-id: uint }
+  {
+    total-contributed: uint,
+    organizations-helped: uint,
+    milestones-enabled: uint,
+    impact-score: uint
+  }
+)
+
+(define-map tier-benefits
+  { tier: (string-ascii 10) }
+  {
+    voting-weight: uint,
+    early-access: bool,
+    fee-discount: uint,
+    exclusive-campaigns: bool
+  }
+)
+
+(define-private (initialize-tier-benefits)
+  (begin
+    (map-set tier-benefits { tier: "bronze" } { voting-weight: u1, early-access: false, fee-discount: u0, exclusive-campaigns: false })
+    (map-set tier-benefits { tier: "silver" } { voting-weight: u2, early-access: true, fee-discount: u5, exclusive-campaigns: false })
+    (map-set tier-benefits { tier: "gold" } { voting-weight: u3, early-access: true, fee-discount: u10, exclusive-campaigns: true })
+    (map-set tier-benefits { tier: "platinum" } { voting-weight: u5, early-access: true, fee-discount: u15, exclusive-campaigns: true })
+    (ok true)
+  )
+)
+
+(define-private (calculate-tier (total-donated uint))
+  (if (>= total-donated platinum-tier-threshold)
+    "platinum"
+    (if (>= total-donated gold-tier-threshold)
+      "gold"
+      (if (>= total-donated silver-tier-threshold)
+        "silver"
+        "bronze"
+      )
+    )
+  )
+)
+
+(define-private (calculate-reputation-points (amount uint) (streak uint))
+  (let
+    (
+      (base-points (/ amount u100000))
+      (streak-bonus (if (> streak u5) (/ (* base-points u20) u100) u0))
+    )
+    (+ base-points streak-bonus)
+  )
+)
+
+(define-private (update-donor-profile (donor principal) (amount uint) (disaster-id uint))
+  (let
+    (
+      (existing-profile (default-to 
+        { total-donated: u0, reputation-points: u0, tier: "bronze", disasters-supported: u0, last-donation-block: u0, streak-count: u0 }
+        (map-get? donor-profiles { donor: donor })
+      ))
+      (new-total (+ (get total-donated existing-profile) amount))
+      (is-consecutive (< (- stacks-block-height (get last-donation-block existing-profile)) u1440))
+      (new-streak (if is-consecutive (+ (get streak-count existing-profile) u1) u1))
+      (new-points (+ (get reputation-points existing-profile) (calculate-reputation-points amount new-streak)))
+      (new-tier (calculate-tier new-total))
+      (disaster-count (+ (get disasters-supported existing-profile) u1))
+    )
+    (map-set donor-profiles { donor: donor }
+      {
+        total-donated: new-total,
+        reputation-points: new-points,
+        tier: new-tier,
+        disasters-supported: disaster-count,
+        last-donation-block: stacks-block-height,
+        streak-count: new-streak
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-private (update-donor-impact (donor principal) (disaster-id uint) (amount uint))
+  (let
+    (
+      (existing-impact (default-to 
+        { total-contributed: u0, organizations-helped: u0, milestones-enabled: u0, impact-score: u0 }
+        (map-get? donor-disaster-impact { donor: donor, disaster-id: disaster-id })
+      ))
+      (new-contributed (+ (get total-contributed existing-impact) amount))
+      (new-impact-score (+ (get impact-score existing-impact) (/ amount u50000)))
+    )
+    (map-set donor-disaster-impact { donor: donor, disaster-id: disaster-id }
+      {
+        total-contributed: new-contributed,
+        organizations-helped: (get organizations-helped existing-impact),
+        milestones-enabled: (get milestones-enabled existing-impact),
+        impact-score: new-impact-score
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (donate-with-impact-tracking (disaster-id uint) (amount uint))
+  (let
+    (
+      (donation-result (try! (donate-to-disaster disaster-id amount)))
+    )
+    (unwrap! (update-donor-profile tx-sender amount disaster-id) (err u500))
+    (unwrap! (update-donor-impact tx-sender disaster-id amount) (err u501))
+    (ok donation-result)
+  )
+)
+
+(define-public (claim-tier-reward (reward-type (string-ascii 20)))
+  (let
+    (
+      (profile (unwrap! (map-get? donor-profiles { donor: tx-sender }) (err u404)))
+      (tier-benefit (unwrap! (map-get? tier-benefits { tier: (get tier profile) }) (err u404)))
+      (reward-amount (/ (get reputation-points profile) u100))
+    )
+    (asserts! (> reward-amount u0) err-invalid-amount)
+    (asserts! (>= (get reputation-points profile) u1000) (err u111))
+    
+    (map-set donor-profiles { donor: tx-sender }
+      (merge profile { reputation-points: (- (get reputation-points profile) u1000) })
+    )
+    (ok reward-amount)
+  )
+)
+
+(define-read-only (get-donor-profile (donor principal))
+  (map-get? donor-profiles { donor: donor })
+)
+
+(define-read-only (get-donor-impact (donor principal) (disaster-id uint))
+  (map-get? donor-disaster-impact { donor: donor, disaster-id: disaster-id })
+)
+
+(define-read-only (get-tier-benefits (tier (string-ascii 10)))
+  (map-get? tier-benefits { tier: tier })
+)
+
+(define-read-only (calculate-donor-tier (total-donated uint))
+  (calculate-tier total-donated)
+)
+
+(define-read-only (get-donor-voting-weight (donor principal))
+  (match (map-get? donor-profiles { donor: donor })
+    some-profile (let
+      (
+        (tier-data (unwrap-panic (map-get? tier-benefits { tier: (get tier some-profile) })))
+      )
+      (get voting-weight tier-data)
+    )
+    u0
+  )
+)
+
+(initialize-tier-benefits)
