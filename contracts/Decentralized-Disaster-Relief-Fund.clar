@@ -744,3 +744,294 @@
 )
 
 (initialize-tier-benefits)
+
+;; Resource Request and Allocation System
+;; Enables targeted resource fulfillment beyond monetary donations
+
+(define-constant err-resource-not-found (err u112))
+(define-constant err-invalid-priority (err u113))
+(define-constant err-already-fulfilled (err u114))
+(define-constant err-insufficient-quantity (err u115))
+(define-constant err-invalid-location (err u116))
+
+;; Resource categories for standardized requests
+(define-constant medical-supplies "medical")
+(define-constant food-water "food")
+(define-constant shelter-materials "shelter")
+(define-constant communication-tech "communication")
+(define-constant transportation "transport")
+
+;; Priority levels for resource allocation
+(define-constant critical-priority u5)
+(define-constant high-priority u4)
+(define-constant medium-priority u3)
+(define-constant low-priority u2)
+(define-constant routine-priority u1)
+
+(define-map resource-requests
+  { request-id: uint }
+  {
+    disaster-id: uint,
+    requesting-org: uint,
+    resource-category: (string-ascii 20),
+    resource-description: (string-ascii 300),
+    quantity-needed: uint,
+    quantity-fulfilled: uint,
+    priority-level: uint,
+    geographic-zone: (string-ascii 50),
+    deadline-block: uint,
+    status: (string-ascii 15),
+    estimated-cost: uint,
+    creation-block: uint
+  }
+)
+
+(define-map resource-fulfillments
+  { fulfillment-id: uint }
+  {
+    request-id: uint,
+    fulfiller: principal,
+    quantity-provided: uint,
+    cost-amount: uint,
+    delivery-method: (string-ascii 50),
+    delivery-status: (string-ascii 15),
+    confirmation-block: uint,
+    verified-by: (optional principal)
+  }
+)
+
+(define-map resource-request-counter
+  { request-type: (string-ascii 20) }
+  { counter: uint }
+)
+
+(define-map resource-fulfillment-counter
+  { fulfillment-type: (string-ascii 20) }
+  { counter: uint }
+)
+
+(define-map geographic-zones
+  { zone-id: (string-ascii 50) }
+  {
+    zone-name: (string-ascii 100),
+    active-requests: uint,
+    total-fulfilled: uint,
+    priority-multiplier: uint
+  }
+)
+
+;; Initialize resource system counters
+(define-private (initialize-resource-system)
+  (begin
+    (map-set resource-request-counter { request-type: "global" } { counter: u0 })
+    (map-set resource-fulfillment-counter { fulfillment-type: "global" } { counter: u0 })
+    (ok true)
+  )
+)
+
+;; Create a new resource request
+(define-public (create-resource-request 
+  (disaster-id uint) 
+  (resource-category (string-ascii 20)) 
+  (resource-description (string-ascii 300))
+  (quantity-needed uint)
+  (priority-level uint)
+  (geographic-zone (string-ascii 50))
+  (deadline-blocks uint)
+  (estimated-cost uint))
+  (let
+    (
+      (current-counter (default-to { counter: u0 } (map-get? resource-request-counter { request-type: "global" })))
+      (new-id (+ (get counter current-counter) u1))
+      (org-data (unwrap! (map-get? relief-organizations { org-id: (unwrap-panic (some u1)) }) err-organization-not-found))
+      (disaster (unwrap! (map-get? disasters { disaster-id: disaster-id }) err-disaster-not-found))
+    )
+    ;; Verify requesting organization is authorized
+    (asserts! (is-eq tx-sender (get wallet org-data)) err-not-authorized)
+    (asserts! (get verified org-data) err-not-authorized)
+    (asserts! (get active disaster) err-invalid-status)
+    (asserts! (and (>= priority-level routine-priority) (<= priority-level critical-priority)) err-invalid-priority)
+    (asserts! (> quantity-needed u0) err-invalid-amount)
+    (asserts! (> deadline-blocks u0) err-invalid-amount)
+    
+    (map-set resource-request-counter { request-type: "global" } { counter: new-id })
+    (map-set resource-requests { request-id: new-id }
+      {
+        disaster-id: disaster-id,
+        requesting-org: u1, ;; Simplified for demo - should derive from tx-sender
+        resource-category: resource-category,
+        resource-description: resource-description,
+        quantity-needed: quantity-needed,
+        quantity-fulfilled: u0,
+        priority-level: priority-level,
+        geographic-zone: geographic-zone,
+        deadline-block: (+ stacks-block-height deadline-blocks),
+        status: "open",
+        estimated-cost: estimated-cost,
+        creation-block: stacks-block-height
+      }
+    )
+    
+    ;; Update geographic zone statistics
+    (let
+      (
+        (zone-data (default-to { zone-name: geographic-zone, active-requests: u0, total-fulfilled: u0, priority-multiplier: u100 }
+                    (map-get? geographic-zones { zone-id: geographic-zone })))
+      )
+      (map-set geographic-zones { zone-id: geographic-zone }
+        (merge zone-data { active-requests: (+ (get active-requests zone-data) u1) })
+      )
+    )
+    (ok new-id)
+  )
+)
+
+;; Fulfill a resource request
+(define-public (fulfill-resource-request 
+  (request-id uint) 
+  (quantity-providing uint)
+  (delivery-method (string-ascii 50)))
+  (let
+    (
+      (request (unwrap! (map-get? resource-requests { request-id: request-id }) err-resource-not-found))
+      (current-counter (default-to { counter: u0 } (map-get? resource-fulfillment-counter { fulfillment-type: "global" })))
+      (new-fulfillment-id (+ (get counter current-counter) u1))
+      (remaining-quantity (- (get quantity-needed request) (get quantity-fulfilled request)))
+      (actual-quantity (if (<= quantity-providing remaining-quantity) quantity-providing remaining-quantity))
+      (cost-per-unit (/ (get estimated-cost request) (get quantity-needed request)))
+      (total-cost (* actual-quantity cost-per-unit))
+    )
+    (asserts! (is-eq (get status request) "open") err-invalid-status)
+    (asserts! (> remaining-quantity u0) err-already-fulfilled)
+    (asserts! (> quantity-providing u0) err-invalid-amount)
+    (asserts! (< stacks-block-height (get deadline-block request)) (err u117)) ;; Not expired
+    
+    ;; Transfer payment for resources
+    (try! (stx-transfer? total-cost tx-sender (as-contract tx-sender)))
+    
+    ;; Create fulfillment record
+    (map-set resource-fulfillment-counter { fulfillment-type: "global" } { counter: new-fulfillment-id })
+    (map-set resource-fulfillments { fulfillment-id: new-fulfillment-id }
+      {
+        request-id: request-id,
+        fulfiller: tx-sender,
+        quantity-provided: actual-quantity,
+        cost-amount: total-cost,
+        delivery-method: delivery-method,
+        delivery-status: "pending",
+        confirmation-block: u0,
+        verified-by: none
+      }
+    )
+    
+    ;; Update request with new fulfilled quantity
+    (let
+      (
+        (new-fulfilled (+ (get quantity-fulfilled request) actual-quantity))
+        (new-status (if (>= new-fulfilled (get quantity-needed request)) "completed" "partial"))
+      )
+      (map-set resource-requests { request-id: request-id }
+        (merge request { 
+          quantity-fulfilled: new-fulfilled,
+          status: new-status
+        })
+      )
+      
+      ;; Update zone statistics if completed
+      (if (is-eq new-status "completed")
+        (let
+          (
+            (zone-data (unwrap-panic (map-get? geographic-zones { zone-id: (get geographic-zone request) })))
+          )
+          (map-set geographic-zones { zone-id: (get geographic-zone request) }
+            (merge zone-data { 
+              active-requests: (- (get active-requests zone-data) u1),
+              total-fulfilled: (+ (get total-fulfilled zone-data) u1)
+            })
+          )
+        )
+        true
+      )
+    )
+    (ok new-fulfillment-id)
+  )
+)
+
+;; Confirm resource delivery (called by requesting organization)
+(define-public (confirm-resource-delivery (fulfillment-id uint))
+  (let
+    (
+      (fulfillment (unwrap! (map-get? resource-fulfillments { fulfillment-id: fulfillment-id }) (err u404)))
+      (request (unwrap! (map-get? resource-requests { request-id: (get request-id fulfillment) }) err-resource-not-found))
+      (org-data (unwrap! (map-get? relief-organizations { org-id: (get requesting-org request) }) err-organization-not-found))
+    )
+    (asserts! (is-eq tx-sender (get wallet org-data)) err-not-authorized)
+    (asserts! (is-eq (get delivery-status fulfillment) "pending") err-invalid-status)
+    
+    (map-set resource-fulfillments { fulfillment-id: fulfillment-id }
+      (merge fulfillment {
+        delivery-status: "delivered",
+        confirmation-block: stacks-block-height,
+        verified-by: (some tx-sender)
+      })
+    )
+    (ok true)
+  )
+)
+
+;; Emergency priority boost for critical situations
+(define-public (boost-request-priority (request-id uint))
+  (let
+    (
+      (request (unwrap! (map-get? resource-requests { request-id: request-id }) err-resource-not-found))
+      (disaster (unwrap! (map-get? disasters { disaster-id: (get disaster-id request) }) err-disaster-not-found))
+    )
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (>= (get severity disaster) emergency-severity-threshold) err-not-emergency)
+    (asserts! (< (get priority-level request) critical-priority) err-invalid-priority)
+    
+    (map-set resource-requests { request-id: request-id }
+      (merge request { priority-level: critical-priority })
+    )
+    (ok true)
+  )
+)
+
+;; Read-only functions for resource system
+(define-read-only (get-resource-request (request-id uint))
+  (map-get? resource-requests { request-id: request-id })
+)
+
+(define-read-only (get-resource-fulfillment (fulfillment-id uint))
+  (map-get? resource-fulfillments { fulfillment-id: fulfillment-id })
+)
+
+(define-read-only (get-zone-statistics (zone-id (string-ascii 50)))
+  (map-get? geographic-zones { zone-id: zone-id })
+)
+
+(define-read-only (get-resource-request-count)
+  (get counter (default-to { counter: u0 } (map-get? resource-request-counter { request-type: "global" })))
+)
+
+(define-read-only (calculate-priority-score (request-id uint))
+  (match (map-get? resource-requests { request-id: request-id })
+    some-request (let
+      (
+        (base-priority (get priority-level some-request))
+        (time-factor (if (< (- (get deadline-block some-request) stacks-block-height) u1440) u2 u1))
+        (zone-multiplier (match (map-get? geographic-zones { zone-id: (get geographic-zone some-request) })
+          some-zone (get priority-multiplier some-zone)
+          u100
+        ))
+      )
+      (* (* base-priority time-factor) (/ zone-multiplier u100))
+    )
+    u0
+  )
+)
+
+;; Initialize the resource system
+(initialize-resource-system)
+
+
