@@ -9,6 +9,10 @@ requirements = []
 path = 'contracts/Decentralized-Disaster-Relief-Fund.clar'
 clarity_version = 3
 epoch = 3.1
+[contracts.CommunityReliefVolunteers]
+path = 'contracts/CommunityReliefVolunteers.clar'
+clarity_version = 3
+epoch = 3.1
 [repl.analysis]
 passes = ['check_checker']
 
